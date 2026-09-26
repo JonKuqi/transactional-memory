@@ -1,60 +1,23 @@
 # Transactional Memory in C
 
-**EPFL CS-453 project — full marks.**  A software transactional memory (STM) implementation in C11, built around the ideas of **Transactional Locking II (TL2)** and then aggressively optimized for throughput.
+**EPFL CS-453 project — full marks.** A software transactional memory (STM) implementation in C11, based on **Transactional Locking II (TL2)** and then aggressively optimized for throughput.
 
 The optimization process took the implementation from roughly **0.5× the provided reference implementation to peaks around 10×** on the course benchmark, depending on workload. The interesting part of the project is not only the final number, but the systems work behind it: versioned locking, optimistic validation, C11 atomics, custom data structures, tagged pointers, deferred reclamation, allocation reduction, and hot-path micro-optimizations.
 
 > **Start here:** [`source/tm.c`](source/tm.c) contains the transactional-memory implementation.
 
-## What this project implements
+## TL2 in a nutshell
 
-The library exposes a small transactional-memory API (`tm_begin`, `tm_read`, `tm_write`, `tm_end`, allocation/free operations) over a shared memory region.
+Software transactional memory lets threads group reads and writes into transactions that either **commit atomically** or **abort and retry**, without protecting the whole program with one coarse-grained lock.
 
-The design follows TL2's core model:
+This implementation follows the core ideas of **Transactional Locking II (TL2)**:
 
-- transactions begin by snapshotting a **global version clock**;
-- every aligned memory word is paired with a **version-lock** (version counter + lock bit);
-- reads are optimistic and are accepted only if the observed version is compatible with the transaction snapshot;
-- writes are buffered privately until commit;
-- a committing writer locks its write set, advances the global version, validates previous reads, publishes buffered writes, and releases the locks with the new version;
+- a transaction starts by snapshotting a **global version clock**;
+- every aligned memory location is associated with a **version-lock** containing a version counter and a lock bit;
+- reads happen optimistically and are accepted only if the observed version is compatible with the transaction snapshot;
+- writes are buffered privately rather than immediately modifying shared memory;
+- at commit, the transaction locks its write set, advances the global version, validates its earlier reads, publishes the buffered writes, and releases the locks with the new version;
 - failed validation aborts the transaction instead of exposing inconsistent state.
-
-```mermaid
-flowchart LR
-    APP[Application / benchmark] --> API[Transactional Memory API]
-    API --> TX[Per-thread transaction state]
-
-    TX --> RS[Read set]
-    TX --> WS[Write set\ncustom hash table]
-    TX --> AF[Allocation / free sets]
-
-    TX --> GVC[Global version clock]
-    TX --> MEM[Shared memory segments]
-    MEM --> VL[Version-lock array\nversion bits + lock bit]
-
-    WS -->|buffer writes| TX
-    VL -->|validate reads| TX
-    GVC -->|snapshot + commit version| TX
-```
-
-## TL2-style commit path
-
-The commit path is where the consistency protocol comes together.
-
-```mermaid
-flowchart TD
-    B[Begin transaction] --> S[Snapshot global version clock]
-    S --> R[Read optimistically\nand record read set]
-    R --> W[Buffer writes in custom hash table]
-    W --> L[Lock every location in write set]
-    L --> C[Increment global version clock]
-    C --> V{Read set still valid?}
-    V -->|No| A[Abort + release locks]
-    V -->|Yes| P[Publish buffered writes]
-    P --> U[Store commit version\nand unlock]
-    U --> F[Process deferred frees]
-    F --> D[Commit]
-```
 
 A version-lock uses the low bit as the lock flag while the remaining bits represent the version:
 
@@ -67,6 +30,55 @@ A version-lock uses the low bit as the lock flag while the remaining bits repres
                                          lock bit
 ```
 
+### TL2-style commit path
+
+```mermaid
+flowchart LR
+    B[Begin] --> S[Snapshot version]
+    S --> R[Optimistic reads]
+    R --> W[Buffer writes]
+    W --> L[Lock write set]
+    L --> C[Advance global clock]
+    C --> V{Validate reads}
+    V -->|valid| P[Publish writes]
+    P --> U[Store new versions + unlock]
+    U --> D[Commit]
+    V -->|conflict| A[Abort]
+```
+
+## Tagged pointers and version-aware reclamation
+
+One of the more interesting parts of the implementation is supporting **dynamic transactional memory segments** safely while other transactions may still hold old references.
+
+Dynamic addresses are represented as 64-bit tagged pointers:
+
+```text
+63                    48 47                               0
++-----------------------+----------------------------------+
+|      segment id       |              offset              |
++-----------------------+----------------------------------+
+        16 bits                         48 bits
+```
+
+The upper 16 bits identify a segment and the lower 48 bits encode the offset inside that segment. Resolving a transactional address therefore gives both the real memory address and the corresponding version-lock without exposing raw segment pointers through the API.
+
+Freeing a segment is also deferred rather than immediate. Each active transaction publishes the global version at which it started. When a segment is logically freed, the implementation:
+
+1. removes it from the active segment map so new transactions cannot access it;
+2. records the version at which it was freed;
+3. keeps the underlying allocation alive while any older transaction may still reference it;
+4. physically `munmap`s the segment only once every active transaction has advanced beyond that version.
+
+```mermaid
+flowchart LR
+    F[Transaction frees segment] --> X[Remove from active map]
+    X --> V[Record free version]
+    V --> W[Wait until min active version is newer]
+    W --> M[munmap + reclaim segment]
+```
+
+This is effectively a lightweight **version/epoch-based reclamation scheme** tied directly to the STM clock. It allows optimistic transactions and dynamic allocation to coexist without letting an old transaction dereference memory that has already been returned to the OS.
+
 ## Performance work
 
 The first correct versions were slower than the provided reference implementation. The final result came from repeatedly profiling the hot paths and replacing general-purpose operations with structures tailored to the transactional workload.
@@ -77,29 +89,31 @@ The first correct versions were slower than the provided reference implementatio
 | **Write-set lookup** | Replaced repeated linear lookup with a custom open-addressed hash table using pointer hashing and linear probing. |
 | **Read-only transactions** | Reuse per-thread transaction objects instead of allocating a new object for every read-only transaction. |
 | **Allocation strategy** | Lazy allocation of read/allocation/free sets and geometric growth reduce work for small transactions. |
-| **Address resolution** | 64-bit tagged pointers encode a segment ID in the upper 16 bits and an offset in the lower 48 bits. |
+| **Address resolution** | Tagged pointers make segment lookup and address translation compact and deterministic. |
 | **Indexing** | Power-of-two alignment is converted to shifts (`log2(align)`) rather than repeated division when locating version-locks. |
 | **Copy hot path** | Specialized aligned 64-bit copying avoids general `memcpy` overhead for the small aligned chunks used by the STM. |
 | **Branch hot paths** | `likely` / `unlikely` compiler hints are used around common and exceptional paths. |
-| **Memory management** | `mmap` backs regions/segments, while version-aware deferred reclamation prevents freeing a segment that an older transaction may still reference. |
+| **Memory management** | `mmap` backs regions/segments, while version-aware deferred reclamation prevents freeing memory still visible to older transactions. |
 
 Together, these changes moved benchmark performance from approximately **0.5× to as high as ~10× the reference implementation**. This figure is workload- and machine-dependent; it is included to show the magnitude of the optimization journey rather than as a universal throughput claim.
 
-## Memory and reclamation design
+## Implementation highlights
 
-Dynamic segments are addressed through tagged pointers:
+The library exposes a small transactional-memory API (`tm_begin`, `tm_read`, `tm_write`, `tm_end`, allocation/free operations) over a shared memory region.
 
-```text
-63                    48 47                               0
-+-----------------------+----------------------------------+
-|      segment id       |              offset              |
-+-----------------------+----------------------------------+
-        16 bits                         48 bits
-```
+Some implementation details worth looking at in [`source/tm.c`](source/tm.c):
 
-Each transaction publishes the version at which it started. When a segment is logically freed, the implementation records the current version and removes the segment from the active map. Physical reclamation is delayed until every active transaction is newer than that free version.
-
-This makes allocation/free compatible with optimistic transactions without allowing an old transaction to dereference memory that has already been returned to the OS.
+- **C11 atomics** with explicit memory-ordering choices;
+- per-location **version-locks** and optimistic read validation;
+- a custom **open-addressed write-set hash table** with pointer hashing and linear probing;
+- **thread-local transaction state** and reuse of read-only transaction objects;
+- **tagged pointers** for transactional segment addressing;
+- `mmap` / `munmap` based memory management;
+- version-aware **deferred reclamation**;
+- lazy allocation and geometric growth of transaction metadata;
+- power-of-two indexing via shifts instead of division;
+- specialized aligned 64-bit copy paths;
+- compiler branch-prediction hints on hot paths.
 
 ## Repository layout
 
